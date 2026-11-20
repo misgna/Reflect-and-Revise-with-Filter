@@ -1,4 +1,3 @@
-from llm_router import get_llm_response_async, get_llm_responses_batch_async
 import asyncio
 import re
 import os
@@ -6,10 +5,26 @@ from rubric_prompts import prepare_asap_rubric, prepare_ets_rubric, prepare_asap
 
 from agent_prompts import EVALUATION_PROMPT, PROMPT_FOR_EVOLUTION_WITH_RATIONALE, PROMPT_FOR_EVOLUTION_WITHOUT_RATIONALE, EXAMPLE_FORMAT_WITH_RATIONALE, EXAMPLE_FORMAT_WITHOUT_RATIONALE, EVALUATION_PROMPT_ASAP, EXAMPLE_FORMAT_ASAP_WITH_RATIONALE, EXAMPLE_FORMAT_ASAP_WITHOUT_RATIONALE
 
-from utils import prepare_ets_dataset, prepare_asap_dataset, prepare_asap2_dataset
+from utils import prepare_ets_dataset, prepare_asap_dataset, prepare_asap2_dataset, load_model_and_tokenizer, get_checkpoint
 from sklearn.metrics import cohen_kappa_score
 import shutil
-ASYNC_BATCH_SIZE = int(os.getenv("ASYNC_BATCH_SIZE", "100"))
+
+import torch
+import numpy as np
+from llm_router_2 import get_llm_response
+from tracker import tracker
+from rubric import is_novel, is_drifted, text2list
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+ASYNC_BATCH_SIZE = int(os.getenv("ASYNC_BATCH_SIZE", "2")) 
 ASYNC_CONCURRENCY = int(os.getenv("ASYNC_CONCURRENCY", "40"))
 
 def parse_rating(response):
@@ -228,7 +243,7 @@ def calculate_qwk_for_batch(model_responses, batch, dataset='ets'):
     return cohen_kappa_score(y_true, y_pred, weights='quadratic')
 
 
-async def evaluate_on_rubric(model_name, params, batch, rubric, evaluation_prompt, dataset):
+async def evaluate_on_rubric(model, tokenizer, params, batch, rubric, evaluation_prompt, dataset):
     for data in batch:
         if dataset == 'ASAP2':
             # essay_prompt = ASAP2_PROMPT.format(
@@ -259,13 +274,17 @@ async def evaluate_on_rubric(model_name, params, batch, rubric, evaluation_promp
     batch_responses = []
     for i in range(0, len(batch), ASYNC_BATCH_SIZE):
         sub_batch = batch[i:i + ASYNC_BATCH_SIZE]
-        responses = await get_llm_responses_batch_async(
+        responses = await get_llm_response(
             [data['messages'] for data in sub_batch],
-            model_name,
+            model,
+            tokenizer,
             params,
-            concurrency=ASYNC_CONCURRENCY,
+            call_type="verifier"
+            #concurrency=ASYNC_CONCURRENCY,
         )
-        batch_responses.extend(responses)
+        #batch_responses.extend(responses)
+        batch_responses.append(responses)
+
     accuracy = calculate_accuracy(batch_responses, batch, dataset)
     qwk = calculate_qwk_for_batch(batch_responses, batch, dataset)
     return batch_responses, accuracy, qwk
@@ -359,8 +378,14 @@ def prepare_dataset(dataset_name, seed_prompt='expert'):
 import random
 import copy
 async def main(args):
+    tracker.start_wall_timer()
     args.with_rationale = args.with_rationale == 'True'
     evaluation_prompt, current_rubric, train_data, _, _ = prepare_dataset(args.dataset, args.seed_prompt)
+    
+    print(current_rubric)
+    # added to capture manually prepared rubric so then measure the rubric drift.
+    initial_rubric = current_rubric
+    
     if args.seed_prompt == 'self':
         # TODO: implement self-generated rubric initialization
         pass
@@ -377,8 +402,11 @@ async def main(args):
             train_data.extend(copy.deepcopy(train_original_data))
             upsample_times += 1
 
-
-    model_name = args.model_name
+    # To run on local server
+    checkpoint = get_checkpoint(args.model_name)
+    model, tokenizer = load_model_and_tokenizer(checkpoint)
+    model_name = f"{checkpoint}".split('/')[-1]
+    
     params = eval(args.api_params)
     trial = args.trial
     if trial == '0':
@@ -413,20 +441,20 @@ async def main(args):
     best_train_accuracy = 0.0
     best_train_qwk = -1.0
     best_rubric = current_rubric
-    _, train_accuracy, train_qwk = await evaluate_on_rubric(model_name, params, train_data, current_rubric, evaluation_prompt, args.dataset)
+    _, train_accuracy, train_qwk = await evaluate_on_rubric(model, tokenizer, params, train_data, current_rubric, evaluation_prompt, args.dataset)
 
     # save the current rubric
-    with open(os.path.join(result_dir, 'initial_rubric.txt'), 'w') as f:
+    with open(os.path.join(result_dir, 'initial_rubric.txt'), 'w', encoding='utf-8') as f:
         f.write(current_rubric)
-    with open(os.path.join(result_dir, 'best_rubric.txt'), 'w') as f:
+    with open(os.path.join(result_dir, 'best_rubric.txt'), 'w', encoding='utf-8') as f:
         f.write(current_rubric) # initially the best rubric is the current rubric
     # save the train score
-    with open(os.path.join(result_dir, 'train_score.txt'), 'w') as f:
+    with open(os.path.join(result_dir, 'train_score.txt'), 'w', encoding='utf-8') as f:
         f.write(f"Step 0, Training Accuracy: {train_accuracy}\n")
         f.write(f"Step 0, Training QWK: {train_qwk}\n")
-    with open(os.path.join(result_dir, 'train_accuracy.txt'), 'w') as f:
+    with open(os.path.join(result_dir, 'train_accuracy.txt'), 'w', encoding='utf-8') as f:
         f.write(f"{train_accuracy}\n")
-    with open(os.path.join(result_dir, 'train_qwk.txt'), 'w') as f:
+    with open(os.path.join(result_dir, 'train_qwk.txt'), 'w', encoding='utf-8') as f:
         f.write(f"{train_qwk}\n")
 
     best_train_accuracy = train_accuracy
@@ -437,7 +465,7 @@ async def main(args):
     for step in range(max_evolution_steps):
         async def evolve_rubrics_for_candidate(step_idx, mc_idx, k_idx, candidate_rubric):
             train_responses, _, _ = await evaluate_on_rubric(
-                model_name, params, train_data, candidate_rubric, evaluation_prompt, args.dataset
+                model, tokenizer, params, train_data, candidate_rubric, evaluation_prompt, args.dataset
             )
             failed_examples = []
             failed_responses = []
@@ -495,13 +523,15 @@ async def main(args):
                         examples=examples_str
                     )
                 # print(prompt_for_evolution)
-                evolution_response = await get_llm_response_async(
+                evolution_response = await get_llm_response(
                     [{"role": "user", "content": prompt_for_evolution}],
-                    model_name,
-                    params
+                    model,
+                    tokenizer,
+                    params,
+                    call_type="generator"
                 )
                 new_rubric = parse_new_rubric(evolution_response)
-                if new_rubric is None:
+                if new_rubric is None: 
                     print("No new rubric proposed")
                     return None
                 print("New Rubric proposed:")
@@ -557,7 +587,7 @@ async def main(args):
         if args.model_name.startswith('openai/') or args.model_name.startswith('google/'):
             # deal with every 5 candidates in parallel to avoid rate limits
             eval_tasks = [
-                evaluate_on_rubric(model_name, params, train_data, candidate, evaluation_prompt, args.dataset)
+                evaluate_on_rubric(model, tokenizer, params, train_data, candidate, evaluation_prompt, args.dataset)
                 for candidate in rubric_candidates
             ]
             print(len(eval_tasks), "candidates to evaluate.")
@@ -572,9 +602,19 @@ async def main(args):
                 new_top_k_candidates.append((candidate, candidate_train_qwk, candidate_train_accuracy))
         else:
             # execute in sequence to avoid rate limits
+            print(f"rubric_candidates: {len(rubric_candidates)}")
             for candidate in rubric_candidates:
+                # if candidate rubric does not have new information or if it is drifted, it will be skipped
+                novel = is_novel(candidate, current_rubric)
+                drifted = is_drifted(candidate, initial_rubric)
+                if not novel or drifted:
+                    print(f"is_novel: {novel}")
+                    print(f"is_drifted: {drifted}")
+                    continue
+                
                 _, candidate_train_accuracy, candidate_train_qwk = await evaluate_on_rubric(
-                    model_name,
+                    model,
+                    tokenizer,
                     params,
                     train_data,
                     candidate,
@@ -594,20 +634,20 @@ async def main(args):
 
         for k in range(len(top_k_candidates)):
             new_rubric, best_candidate_qwk, accuracy_of_best_candidate = top_k_candidates[k]
-            with open(os.path.join(result_dir, 'best_rubric', f'step_{step+1}_top{k+1}.txt'), 'w') as f:
+            with open(os.path.join(result_dir, 'best_rubric', f'step_{step+1}_top{k+1}.txt'), 'w', encoding='utf-8') as f:
                 f.write(new_rubric)
         
-        with open(os.path.join(result_dir, 'train_score_top_candidates.txt'), 'a') as f:
+        with open(os.path.join(result_dir, 'train_score_top_candidates.txt'), 'a', encoding='utf-8') as f:
             for k in range(len(top_k_candidates)):
                 new_rubric, best_candidate_qwk, accuracy_of_best_candidate = top_k_candidates[k]
                 f.write(f"Step {step+1}, Top {k+1} Candidate, Training Accuracy: {accuracy_of_best_candidate}\n")
                 f.write(f"Step {step+1}, Top {k+1} Candidate, Training QWK: {best_candidate_qwk}\n")
         best_candidate_qwk, accuracy_of_best_candidate = top_k_candidates[0][1], top_k_candidates[0][2]
-        with open(os.path.join(result_dir, 'train_accuracy.txt'), 'a') as f:
+        with open(os.path.join(result_dir, 'train_accuracy.txt'), 'a', encoding='utf-8') as f:
             f.write(f"{accuracy_of_best_candidate}\n")
-        with open(os.path.join(result_dir, 'train_qwk.txt'), 'a') as f:
+        with open(os.path.join(result_dir, 'train_qwk.txt'), 'a', encoding='utf-8') as f:
             f.write(f"{best_candidate_qwk}\n")
-        with open(os.path.join(result_dir, 'train_score.txt'), 'a') as f:
+        with open(os.path.join(result_dir, 'train_score.txt'), 'a', encoding='utf-8') as f:
             f.write(f"Step {step+1}, Training Accuracy (best candidate): {accuracy_of_best_candidate}\n")
             f.write(f"Step {step+1}, Training QWK (best candidate): {best_candidate_qwk}\n")
 
@@ -616,7 +656,9 @@ async def main(args):
             best_rubric = top_k_candidates[0][0]
             with open(os.path.join(result_dir, 'best_rubric.txt'), 'w') as f:
                 f.write(best_rubric)
-    
+                
+    tracker.stop_wall_timer()
+    tracker.print_summary(run_name=f"{args.filtering}")
 
 if __name__ == "__main__":
     import argparse
@@ -635,11 +677,12 @@ if __name__ == "__main__":
     parser.add_argument('--top_k', type=int, default=3)
 
     parser.add_argument('--seed_prompt', type=str, choices=['simplest', 'simple', 'expert', 'self'], default='expert')
-    parser.add_argument('--model_name', type=str, default='openai/gpt-5-mini')
-    parser.add_argument('--dataset', type=str, default='asap_1', choices=['ets', 'ets3', 'asap_1','ASAP2'])
+    parser.add_argument('--model_name', type=str, default='llama3_8b') # original: openai/gpt-5-mini
+    parser.add_argument('--dataset', type=str, default='asap_9', choices=['ets', 'ets3', 'asap_1','ASAP2'])
     parser.add_argument('--api_params', type=str, default='{"temperature":1.0,"max_tokens":8192}')
     parser.add_argument('--train_size', type=int, default=100)
-    parser.add_argument('--batch_sizes', type=positive_int, nargs='+', default=[4, 8, 12])
+    parser.add_argument('--batch_sizes', type=positive_int, nargs='+', default=[2, 4, 6])
     parser.add_argument('--monte_carlo_runs', type=positive_int, default=1)
+    parser.add_argument('--filtering', type=str, choices=['no_filter', 'cosine', 'it_ot', 'it_sm'], default="no_filter")
     args = parser.parse_args()
     asyncio.run(main(args))

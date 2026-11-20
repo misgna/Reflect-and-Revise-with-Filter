@@ -1,3 +1,4 @@
+from seed_creativity_rubric import get_rubric_r2c
 SIMPLEST_ETS_RUBRIC = 'Based on the response\'s content, rate the response on a scale of 1 to 5.'
 
 SIMPLE_ETS_RUBRIC = '''\
@@ -539,6 +540,8 @@ SCORE OF 1: An essay in this category demonstrates very little or no mastery, an
 
 SIMPLEST_ASAP2_RUBRIC = 'Based on the response\'s content, rate the response on a scale of 1 to 6.'
 
+ASAP_RUBRIC_9, SIMPLEST_ASAP_RUBRIC_9 = get_rubric_r2c()
+
 
 def prepare_asap_rubric(essay_set=1, seed_prompt='expert'):
     if essay_set == 1:
@@ -603,6 +606,13 @@ def prepare_asap_rubric(essay_set=1, seed_prompt='expert'):
             return ASAP_RUBRIC_8 # Same as expert
         elif seed_prompt == 'simplest':
             return SIMPLEST_ASAP_RUBRIC_8 
+    elif essay_set == 9:
+        if seed_prompt == 'expert':
+            return ASAP_RUBRIC_9
+        elif seed_prompt == 'simple':
+            return ASAP_RUBRIC_9 # Same as expert
+        elif seed_prompt == 'simplest':
+            return SIMPLEST_ASAP_RUBRIC_9 
     else:
         raise ValueError(f"No rubric defined for essay set {essay_set}")
 
@@ -817,6 +827,8 @@ def prepare_prompt_for_asap(essay_set=1):
         return ASAP_PROMPT_7
     elif essay_set == 8:
         return ASAP_PROMPT_8
+    elif essay_set == 9:
+        return ASAP_PROMPT_2
     else:
         raise ValueError(f"Unsupported essay_set: {essay_set}")
     

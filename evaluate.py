@@ -1,4 +1,7 @@
-from inference import prepare_dataset, evaluate_on_rubric, ASYNC_BATCH_SIZE, get_llm_responses_batch_async, calculate_accuracy, calculate_qwk_for_batch, quality_to_desired_rating
+from inference import prepare_dataset, evaluate_on_rubric, ASYNC_BATCH_SIZE, calculate_accuracy, calculate_qwk_for_batch, quality_to_desired_rating
+from llm_router_2 import get_llm_response
+from utils import prepare_ets_dataset, prepare_asap_dataset, prepare_asap2_dataset, load_model_and_tokenizer, get_checkpoint
+
 import shutil
 import asyncio
 import re
@@ -58,12 +61,12 @@ async def evaluate_on_rubric_few_shot(model_name, params, batch, rubric, evaluat
     batch_responses = []
     for i in range(0, len(batch), ASYNC_BATCH_SIZE):
         sub_batch = batch[i:i + ASYNC_BATCH_SIZE]
-        responses = await get_llm_responses_batch_async(
+        responses = await get_llm_response(
             [data['messages'] for data in sub_batch],
             model_name,
             params,
         )
-        batch_responses.extend(responses)
+        batch_responses.append(responses)
     accuracy = calculate_accuracy(batch_responses, batch, dataset)
     qwk = calculate_qwk_for_batch(batch_responses, batch, dataset)
     return batch_responses, accuracy, qwk
@@ -108,8 +111,10 @@ async def main(args):
     else:
         examples = ''
         
-
-    model_name = args.model_name
+    checkpoint = get_checkpoint(args.model_name)
+    model, tokenizer = load_model_and_tokenizer(checkpoint)
+    model_name = f"{checkpoint}".split('/')[-1]
+   
     params = eval(args.api_params)
     if args.trial == '0':
         result_dir = './evaluation_results'
@@ -185,12 +190,12 @@ if __name__ == "__main__":
     parser.add_argument('--trial', type=str, default='0')
 
     parser.add_argument('--seed_prompt', type=str, choices=['simplest', 'simple', 'expert', 'self'], default='expert')
-    parser.add_argument('--model_name', type=str, default='openai/gpt-4.1')
+    parser.add_argument('--model_name', type=str, default='llama3_8b') # original: openai/gpt-5-mini
     parser.add_argument('--dataset', type=str, default='asap_1', choices=['ets', 'ets3', 'asap_1', 'asap_2', 'asap_3', 'asap_4', 'asap_5', 'asap_6', 'asap_7', 'asap_8', 'ASAP2'])
     parser.add_argument('--api_params', type=str, default='{"temperature":0.8,"max_tokens":8192}')
     parser.add_argument('--few_shot_num', type=int, default=4)
     parser.add_argument('--with_rationale', type=str, default='True', choices=['True', 'False'])
-    parser.add_argument('--iteration', type=int, default=10)
+    parser.add_argument('--iteration', type=int, default=3)
     parser.add_argument('--top_k', type=int, default=3)
     parser.add_argument('--train_size', type=int, default=20)
     parser.add_argument('--batch_sizes', type=positive_int, nargs='+', default=[4, 8, 12])
