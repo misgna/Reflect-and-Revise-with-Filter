@@ -1,5 +1,5 @@
 # Reflect-and-Revise-with-Rubric-Filtering
-We have extended the Reflect-and-Revise in order to filter rubric for drift and novelty. We re-purpose conditional entropy for quantifying structural drift and novelty.
+We augment the Reflect-and-Revise approach with the capability to capture drift and novelty by repurposing conditional entropy to quantify both.
 
 # Reflect-and-Revise
 Official implementation of "Automated Refinement of Essay Scoring Rubrics for Language Models via Reflect-and-Revise"
